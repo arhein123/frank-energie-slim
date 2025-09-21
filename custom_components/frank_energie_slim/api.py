@@ -100,7 +100,7 @@ class FrankEnergie:
     def get_smart_battery_sessions(self, device_id, start_date, end_date):
         if not self.auth:
             raise Exception("Authentication required")
-
+    
         query = {
             "query": """
                 query SmartBatterySessions($startDate: String!, $endDate: String!, $deviceId: String!) {
@@ -120,9 +120,9 @@ class FrankEnergie:
                     periodTradeIndex
                     periodTradingResult
                     sessions {
-                      cumulativeResult    # <-- vervangt cumulativeTradingResult
+                      cumulativeResult
                       date
-                      result              # <-- vervangt tradingResult
+                      result
                       status
                       tradeIndex
                     }
@@ -132,14 +132,14 @@ class FrankEnergie:
             "operationName": "SmartBatterySessions",
             "variables": {
                 "deviceId": device_id,
-                "startDate": start_date.strftime('%Y-%m-%d'),
-                "endDate": end_date.strftime('%Y-%m-%d')
-            }
+                "startDate": start_date.strftime("%Y-%m-%d"),
+                "endDate": end_date.strftime("%Y-%m-%d"),
+            },
         }
-
+    
         resp = self.query(query)
-
-        # compat naar oude veldnamen
+    
+        # compat: map nieuwe veldnamen naar de oude die elders verwacht worden
         try:
             node = ((resp.get("data") or {}).get("smartBatterySessions") or {})
             sessions = node.get("sessions") or []
@@ -151,7 +151,8 @@ class FrankEnergie:
                         s["tradingResult"] = s["result"]
         except Exception:
             pass
-
+    
         return resp
+
     def is_authenticated(self):
         return self.auth is not None

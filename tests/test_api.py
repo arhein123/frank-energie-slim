@@ -87,12 +87,16 @@ class TestFrankEnergie(unittest.TestCase):
                         "periodTradingResult": 3.0,
                         "sessions": [
                             {
-                                "cumulativeTradingResult": 3.0,
+                                "cumulativeResult": 3.0,
                                 "date": "2025-04-01",
-                                "tradingResult": 3.0
+                                "result": 3.0
+                            },
+                            {
+                                "cumulativeResult": 17.0,
+                                "date": "2025-04-10",
+                                "result": 14.0
                             }
-                        ],
-                        "totalTradingResult": 17.0
+                        ]
                     }
                 }
             }

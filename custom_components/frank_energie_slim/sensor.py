@@ -1,253 +1,169 @@
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.event import async_track_time_interval
-from .api import FrankEnergie
-from .entities import (
-    FrankEnergieBatterySessionResultSensor,
-    FrankEnergieTotalResultSensor,
-    FrankEnergieBatteryModeSensor,
-    FrankEnergieBatteryStateOfChargeSensor,
-    FrankEnergieTotalAvgSocSensor,
-    FrankEnergieTotalLastModeSensor,
-    FrankEnergieTotalLastUpdateSensor,
-)
-from datetime import datetime, timedelta
-from dataclasses import dataclass
+from __future__ import annotations
+
 import logging
+from datetime import timedelta, datetime
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, CoordinatorEntity
+from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
+from homeassistant.config_entries import ConfigEntry
 
-_LOGGER: logging.Logger = logging.getLogger(__package__)
+from .api import FrankEnergie
 
-# Map from API response field to entity name suffix
-RESULT_SENSOR_MAP = {
-    'periodEpexResult': 'epex',
-    'periodFrankSlim': 'frankslim',
-    'periodImbalanceResult': 'handelsresultaat',
-    'periodTradingResult': 'brutoresultaat',
-    'periodTotalResult': 'nettoresultaat',
-    'totalTradingResult': 'trading_result',
-}
-SESSION_RESULT_KEYS = list(RESULT_SENSOR_MAP.keys())
+_LOGGER = logging.getLogger(__name__)
 
-@dataclass
-class BatteryEntityGroup:
-    mode_sensor: object
-    soc_sensor: object
-    result_sensors: list
+DOMAIN = "frank_energie_slim"
+SCAN_INTERVAL = timedelta(minutes=15)
 
-def get_battery_mode_from_settings(settings):
-    """Return a normalized mode string based on battery settings."""
-    battery_mode = (settings.get('batteryMode') or '').upper()
-    strategy = (settings.get('imbalanceTradingStrategy') or '').upper()
-    self_consumption = settings.get('selfConsumptionTradingAllowed')
-    if battery_mode == 'IMBALANCE_TRADING':
-        if strategy == 'AGGRESSIVE':
-            return 'imbalance_aggressive'
-        else:
-            return 'imbalance'
-    elif self_consumption:
-        return 'self_consumption_plus'
-    return battery_mode.lower() if battery_mode else None
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
-    """Set up the Frank Energie integration and sensors."""
-    _LOGGER.info("Setting up Frank Energie entry")
-    username = entry.data.get("username")
-    password = entry.data.get("password")
+    """Set up sensors from a config entry."""
+    username = entry.data.get(CONF_USERNAME)
+    password = entry.data.get(CONF_PASSWORD)
+
     client = FrankEnergie()
-    await hass.async_add_executor_job(client.login, username, password)
-    data = await hass.async_add_executor_job(client.get_smart_batteries)
-    batteries = data['data']['smartBatteries']
+
+    def _login_blocking():
+        # login in executor om I/O te vermijden in event loop
+        return client.login(username, password)
+
+    def _fetch_batteries_blocking():
+        return client.get_smart_batteries()
+
+    def _fetch_summary_blocking(device_id: str):
+        return client.get_smart_battery_summary(device_id)
+
+    def _fetch_sessions_blocking(device_id: str, start: datetime, end: datetime):
+        return client.get_smart_battery_sessions(device_id, start, end)
+
+    # Login (blocking in executor)
+    auth = await hass.async_add_executor_job(_login_blocking)
+    if not auth:
+        _LOGGER.error("Login mislukt, stop setup")
+        return
+
+    # Haal batterijen
+    batteries_resp = await hass.async_add_executor_job(_fetch_batteries_blocking)
+    device_ids = []
+    try:
+        device_ids = [b["id"] for b in (batteries_resp.get("data") or {}).get("smartBatteries", [])]
+    except Exception as e:
+        _LOGGER.error("Kon smartBatteries niet parsen: %s, resp=%r", e, batteries_resp)
+        return
+
+    if not device_ids:
+        _LOGGER.warning("Geen smartBatteries gevonden voor deze account")
+        return
+
+    # Zet per batterij een coordinator + entity op
     entities = []
-    battery_ids = []
-    battery_details = []
-    battery_entity_groups = []
-
-    # Create total result sensors only once (not per battery)
-    total_entities = [
-        FrankEnergieTotalResultSensor(hass, result_key, suffix)
-        for result_key, suffix in RESULT_SENSOR_MAP.items()
-    ]
-
-    for battery in batteries:
-        battery_ids.append(battery['id'])
-        # Fetch battery details
-        details_data = await hass.async_add_executor_job(client.get_smart_battery_details, battery['id'])
-        details = details_data['data']
-        battery_details.append(details)
-        today = datetime.now()
-        session_data = await hass.async_add_executor_job(
-            client.get_smart_battery_sessions, battery['id'], today, today
+    for dev_id in device_ids:
+        coordinator = FrankBatteryCoordinator(
+            hass=hass,
+            logger=_LOGGER,
+            client=client,
+            device_id=dev_id,
         )
-        session = session_data['data']['smartBatterySessions']
-        # Extract mode and stateOfCharge
-        smart_battery = details.get('smartBattery', {})
-        summary = details.get('smartBatterySummary', {})
-        settings = smart_battery.get('settings', {})
-        # Determine mode using helper function
-        mode = get_battery_mode_from_settings(settings)
-        state_of_charge = summary.get('lastKnownStateOfCharge')
-        # Create sensors
-        mode_sensor = FrankEnergieBatteryModeSensor(hass, battery['id'], mode, details)
-        soc_sensor = FrankEnergieBatteryStateOfChargeSensor(hass, battery['id'], state_of_charge, details)
-        result_sensors = [
-            FrankEnergieBatterySessionResultSensor(hass, session, result_key, suffix, details)
-            for result_key, suffix in RESULT_SENSOR_MAP.items()
-        ]
-        group = BatteryEntityGroup(mode_sensor, soc_sensor, result_sensors)
-        battery_entity_groups.append(group)
-        entities.extend([mode_sensor, soc_sensor] + result_sensors)
+        await coordinator.async_config_entry_first_refresh()
+        entities.append(FrankBatterySummarySensor(coordinator, dev_id))
+        entities.append(FrankBatteryTradingResultSensor(coordinator, dev_id))
 
-    # Add total result sensors only once
-    entities.extend(total_entities)
+    async_add_entities(entities)
 
-    # Add total avg soc, last mode, and last update sensors
-    total_avg_soc_entity = FrankEnergieTotalAvgSocSensor(hass)
-    total_last_mode_entity = FrankEnergieTotalLastModeSensor(hass)
-    total_last_update_entity = FrankEnergieTotalLastUpdateSensor(hass)
-    entities.extend([total_avg_soc_entity, total_last_mode_entity, total_last_update_entity])
 
-    for entity in entities:
-        unique_id = getattr(entity, '_attr_unique_id', None)
-        _LOGGER.info(f"Registered entity with unique_id: {unique_id} and entity_id: {getattr(entity, 'entity_id', None)}")
+class FrankBatteryCoordinator(DataUpdateCoordinator):
+    """Coordinator die summary en recente sessions ophaalt."""
 
-    async_add_entities(entities, update_before_add=True)
+    def __init__(self, hass: HomeAssistant, logger: logging.Logger, client: FrankEnergie, device_id: str):
+        super().__init__(hass, logger, name=f"{DOMAIN}_{device_id}", update_interval=SCAN_INTERVAL)
+        self._client = client
+        self.device_id = device_id
+        self.summary = None
+        self.sessions_node = None
 
-    # Store for periodic update
-    hass.data.setdefault("frank_energie_slim", {})[entry.entry_id] = {
-        "client": client,
-        "battery_ids": battery_ids,
-        "entities": entities,
-        "total_entities": total_entities,
-        "battery_details": battery_details,
-        "username": username,
-        "password": password,
-    }
+    async def _async_update_data(self):
+        def _fetch():
+            # Summary
+            summary = self._client.get_smart_battery_summary(self.device_id)
 
-    def calc_avg_soc_and_last_mode(socs, modes):
-        """Calculate average state of charge and last mode from lists."""
-        avg_soc = sum([s for s in socs if s is not None]) / len([s for s in socs if s is not None]) if socs else None
-        last_mode = modes[-1] if modes else None
-        return avg_soc, last_mode
+            # Sessions van de laatste 7 dagen
+            end = datetime.utcnow()
+            start = end - timedelta(days=7)
+            sessions = self._client.get_smart_battery_sessions(self.device_id, start, end)
 
-    async def fetch_battery_data(fetch_details=True):
-        """Fetch session, mode, and state of charge for all batteries."""
-        sessions, modes, socs = [], [], []
-        new_battery_details = []  # Collect fresh details if fetch_details is True
-        for i, battery_id in enumerate(battery_ids):
-            today = datetime.now()
-            try:
-                session_data = await hass.async_add_executor_job(
-                    client.get_smart_battery_sessions, battery_id, today, today
-                )
-                if fetch_details:
-                    details_data = await hass.async_add_executor_job(client.get_smart_battery_details, battery_id)
-                    details = details_data['data']
-                    new_battery_details.append(details)
-                else:
-                    details = battery_details[i]
-            except Exception as e:
-                if str(e) == "Authentication required":
-                    _LOGGER.info("Authentication token expired, attempting to re-authenticate")
-                    # Get credentials from stored data
-                    for entry_id, data in hass.data["frank_energie_slim"].items():
-                        if data.get("client") == client:
-                            username = data.get("username")
-                            password = data.get("password")
-                            break
-                    else:
-                        _LOGGER.error("Could not find credentials for re-authentication")
-                        raise
+            return {"summary": summary, "sessions": sessions}
 
-                    # Re-authenticate
-                    await hass.async_add_executor_job(client.login, username, password)
+        data = await self.hass.async_add_executor_job(_fetch)
 
-                    # Retry the operation
-                    session_data = await hass.async_add_executor_job(
-                        client.get_smart_battery_sessions, battery_id, today, today
-                    )
-                    if fetch_details:
-                        details_data = await hass.async_add_executor_job(client.get_smart_battery_details, battery_id)
-                        details = details_data['data']
-                        new_battery_details.append(details)
-                    else:
-                        details = battery_details[i]
-                else:
-                    # Re-raise if it's not an authentication error
-                    raise
-            smart_battery = details.get('smartBattery', {})
-            summary = details.get('smartBatterySummary', {})
-            settings = smart_battery.get('settings', {})
-            # Determine mode using helper function
-            mode = get_battery_mode_from_settings(settings)
-            state_of_charge = summary.get('lastKnownStateOfCharge')
-            modes.append(mode)
-            socs.append(state_of_charge)
-            session = session_data['data']['smartBatterySessions']
-            sessions.append(session)
-        # If we fetched new details, update battery_details in-place
-        if fetch_details and new_battery_details:
-            battery_details.clear()
-            battery_details.extend(new_battery_details)
-        return sessions, modes, socs
+        # Defensief parsen
+        self.summary = ((data.get("summary") or {}).get("data") or {}).get("smartBatterySummary")
+        node = ((data.get("sessions") or {}).get("data") or {}).get("smartBatterySessions")
 
-    def update_battery_entities(battery_entity_groups, sessions, modes, socs):
-        """Update all battery-related sensor entities with new data."""
-        for i, group in enumerate(battery_entity_groups):
-            session = sessions[i]
-            mode = modes[i]
-            state_of_charge = socs[i]
-            group.mode_sensor._state = mode
-            group.soc_sensor._state = state_of_charge
-            for idx, key in enumerate(SESSION_RESULT_KEYS):
-                group.result_sensors[idx]._session = session
-                group.result_sensors[idx]._state = session[key]
-                group.result_sensors[idx]._attr_extra_state_attributes = {}
-            for entity in [group.mode_sensor, group.soc_sensor] + group.result_sensors:
-                if getattr(entity, 'hass', None) is not None:
-                    entity.async_write_ha_state()
+        if not node:
+            _LOGGER.warning("Geen smartBatterySessions in response voor %s", self.device_id)
+            self.sessions_node = None
+            return data
 
-    def update_total_entities(total_entities, sessions, modes, socs):
-        """Update all total result sensor entities with aggregated data, and update avg soc/mode sensors."""
-        avg_soc, last_mode = calc_avg_soc_and_last_mode(socs, modes)
-        for idx, key in enumerate(SESSION_RESULT_KEYS):
-            total = sum(float(session.get(key, 0) or 0) for session in sessions)
-            total_entities[idx]._state = total
-            if getattr(total_entities[idx], 'hass', None) is not None:
-                total_entities[idx].async_write_ha_state()
-        total_avg_soc_entity._state = avg_soc
-        if getattr(total_avg_soc_entity, 'hass', None) is not None:
-            total_avg_soc_entity.async_write_ha_state()
-        total_last_mode_entity._state = last_mode
-        if getattr(total_last_mode_entity, 'hass', None) is not None:
-            total_last_mode_entity.async_write_ha_state()
-        # Set the most recent lastUpdate from all battery_details
-        last_updates = [
-            details.get('smartBatterySummary', {}).get('lastUpdate')
-            for details in battery_details
-            if details.get('smartBatterySummary', {}).get('lastUpdate')
-        ]
-        if last_updates:
-            # ISO8601 strings, so max() gives the latest
-            total_last_update_entity._state = max(last_updates)
-        else:
-            total_last_update_entity._state = None
-        if getattr(total_last_update_entity, 'hass', None) is not None:
-            total_last_update_entity.async_write_ha_state()
+        # Nieuwe veldnamen: cumulativeResult/result
+        sessions = (node.get("sessions") or []) if isinstance(node, dict) else []
+        self.sessions_node = {
+            "periodTradingResult": node.get("periodTradingResult"),
+            "sessions": sessions,
+        }
+        return data
 
-    async def update_totals():
-        """Update total sensors immediately after setup using cached battery details."""
-        sessions, modes, socs = await fetch_battery_data(fetch_details=False)
-        update_total_entities(total_entities, sessions, modes, socs)
 
-    # Immediately update totals after setup
-    hass.async_create_task(update_totals())
+class FrankBatterySummarySensor(CoordinatorEntity,):
+    _attr_has_entity_name = True
 
-    async def _refresh_sensors(now):
-        """Periodic update of all battery and total sensors."""
-        sessions, modes, socs = await fetch_battery_data(fetch_details=True)
-        _LOGGER.info(f"All sessions collected for totals: {sessions}")
-        update_battery_entities(battery_entity_groups, sessions, modes, socs)
-        update_total_entities(total_entities, sessions, modes, socs)
+    def __init__(self, coordinator: FrankBatteryCoordinator, device_id: str):
+        super().__init__(coordinator)
+        self._device_id = device_id
+        self._attr_name = f"Frank Smart Battery {device_id} Status"
+        self._attr_unique_id = f"{DOMAIN}_{device_id}_status"
 
-    async_track_time_interval(hass, _refresh_sensors, timedelta(minutes=5))
+    @property
+    def state(self):
+        summary = self.coordinator.summary or {}
+        return summary.get("lastKnownStatus")
+
+    @property
+    def extra_state_attributes(self):
+        s = self.coordinator.summary or {}
+        return {
+            "soc": s.get("lastKnownStateOfCharge"),
+            "last_update": s.get("lastUpdate"),
+            "total_result": s.get("totalResult"),
+        }
+
+
+class FrankBatteryTradingResultSensor(CoordinatorEntity,):
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator: FrankBatteryCoordinator, device_id: str):
+        super().__init__(coordinator)
+        self._device_id = device_id
+        self._attr_name = f"Frank Smart Battery {device_id} Trading Result"
+        self._attr_unique_id = f"{DOMAIN}_{device_id}_trading_result"
+
+    @property
+    def state(self):
+        node = self.coordinator.sessions_node or {}
+        # Fallback: laatste cumulatief indien periodTradingResult ontbreekt
+        if node.get("periodTradingResult") is not None:
+            return node["periodTradingResult"]
+        sessions = node.get("sessions") or []
+        if sessions:
+            last = sessions[-1]
+            return last.get("cumulativeResult")
+        return None
+
+    @property
+    def extra_state_attributes(self):
+        node = self.coordinator.sessions_node or {}
+        sessions = node.get("sessions") or []
+        return {
+            "sessions_count": len(sessions),
+            "last_session_result": (sessions[-1].get("result") if sessions else None),
+            "last_session_status": (sessions[-1].get("status") if sessions else None),
+        }

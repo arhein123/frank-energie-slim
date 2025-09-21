@@ -144,14 +144,26 @@ class FrankEnergie:
             node = ((resp.get("data") or {}).get("smartBatterySessions") or {})
             sessions = node.get("sessions") or []
             if isinstance(sessions, list):
+                total_trading_result = node.get("totalTradingResult")
                 for s in sessions:
+                    if not isinstance(s, dict):
+                        continue
                     if "cumulativeTradingResult" not in s and "cumulativeResult" in s:
                         s["cumulativeTradingResult"] = s["cumulativeResult"]
                     if "tradingResult" not in s and "result" in s:
                         s["tradingResult"] = s["result"]
+                    if total_trading_result is None:
+                        cumulative = s.get("cumulativeTradingResult")
+                        if cumulative is not None:
+                            total_trading_result = cumulative
+                if total_trading_result is not None:
+                    try:
+                        node["totalTradingResult"] = float(total_trading_result)
+                    except (TypeError, ValueError):
+                        node["totalTradingResult"] = total_trading_result
         except Exception:
             pass
-    
+
         return resp
 
     def is_authenticated(self):

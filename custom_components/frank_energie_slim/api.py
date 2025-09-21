@@ -137,8 +137,21 @@ class FrankEnergie:
             }
         }
 
-        return self.query(query)
+    resp = self.query(query)
 
+    # Compat: map nieuwe velden naar oude sleutel-namen die elders verwacht kunnen worden
+    try:
+        node = ((resp.get("data") or {}).get("smartBatterySessions") or {})
+        sessions = node.get("sessions") or []
+        if isinstance(sessions, list):
+            for s in sessions:
+                if "cumulativeTradingResult" not in s and "cumulativeResult" in s:
+                    s["cumulativeTradingResult"] = s["cumulativeResult"]
+                if "tradingResult" not in s and "result" in s:
+                    s["tradingResult"] = s["result"]
+    except Exception:
+        pass
 
+    return resp
     def is_authenticated(self):
         return self.auth is not None
